@@ -1,0 +1,21 @@
+services:
+  tcp-relay:
+    build: .
+    container_name: tcp-relay
+    restart: unless-stopped
+    command:
+      - relay
+      - --public-bind
+      - 0.0.0.0:2222
+      - --control-bind
+      - 0.0.0.0:7000
+      - --data-bind
+      - 0.0.0.0:7001
+      - --token
+      - ${PROXY_TOKEN}
+    ports:
+      - "2222:2222"
+      - "7000:7000"
+      - "7001:7001"
+    environment:
+      PROXY_TOKEN: ${PROXY_TOKEN}
