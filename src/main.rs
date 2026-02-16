@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +66,8 @@ enum Command {
         #[arg(long, env = "PROXY_RECONNECT_SECS", default_value_t = 3)]
         reconnect_secs: u64,
     },
+    /// Interactive terminal setup wizard for client or agent.
+    Setup,
 }
 
 #[derive(Clone)]
@@ -203,6 +205,7 @@ async fn main() -> io::Result<()> {
             };
             run_agent(config).await
         }
+        Command::Setup => run_setup_wizard(),
     }
 }
 
@@ -664,6 +667,143 @@ fn parse_u16(value: &str, label: &str) -> io::Result<u16> {
             format!("failed to parse {label} as u16 ('{value}'): {err}"),
         )
     })
+}
+
+fn run_setup_wizard() -> io::Result<()> {
+    println!("TCP Proxy setup wizard");
+    println!();
+    println!("Select role:");
+    println!("1) Agent (home machine exposing a local service)");
+    println!("2) Client (machine connecting to an assigned public port)");
+    println!();
+
+    let selection = prompt_u8("Enter choice", Some(1))?;
+    match selection {
+        1 => run_agent_setup_wizard(),
+        2 => run_client_setup_wizard(),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported setup role selection",
+        )),
+    }
+}
+
+fn run_agent_setup_wizard() -> io::Result<()> {
+    println!();
+    println!("Agent setup");
+    println!("-----------");
+
+    let relay_host = prompt_string("Relay host / IP", None)?;
+    let control_port = prompt_u16("Control port", Some(7000))?;
+    let data_port = prompt_u16("Data port", Some(7001))?;
+    let target = prompt_string("Local target (host:port)", Some("127.0.0.1:22"))?;
+    let token = prompt_string("Shared token", None)?;
+    let reconnect_secs = prompt_u64("Reconnect seconds", Some(3))?;
+
+    println!();
+    println!("Run this command:");
+    println!(
+        "cargo run -- agent --relay-host {} --control-port {} --data-port {} --target {} --token {} --reconnect-secs {}",
+        shell_quote(&relay_host),
+        control_port,
+        data_port,
+        shell_quote(&target),
+        shell_quote(&token),
+        reconnect_secs
+    );
+
+    println!();
+    println!("Or with environment variables:");
+    println!("export PROXY_RELAY_HOST={}", shell_quote(&relay_host));
+    println!("export PROXY_CONTROL_PORT={control_port}");
+    println!("export PROXY_DATA_PORT={data_port}");
+    println!("export PROXY_TARGET={}", shell_quote(&target));
+    println!("export PROXY_TOKEN={}", shell_quote(&token));
+    println!("export PROXY_RECONNECT_SECS={reconnect_secs}");
+    println!("cargo run -- agent");
+
+    Ok(())
+}
+
+fn run_client_setup_wizard() -> io::Result<()> {
+    println!();
+    println!("Client setup");
+    println!("------------");
+    println!("Use the assigned port printed by the agent when it connects.");
+
+    let public_host = prompt_string("Public relay host / IP", None)?;
+    let assigned_port = prompt_u16("Assigned public port", None)?;
+    let username = prompt_string("SSH username", Some("root"))?;
+
+    println!();
+    println!("Connect with:");
+    println!(
+        "ssh -p {} {}@{}",
+        assigned_port,
+        shell_quote(&username),
+        shell_quote(&public_host)
+    );
+
+    Ok(())
+}
+
+fn prompt_string(prompt: &str, default: Option<&str>) -> io::Result<String> {
+    loop {
+        match default {
+            Some(value) => print!("{prompt} [{value}]: "),
+            None => print!("{prompt}: "),
+        }
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim();
+
+        if trimmed.is_empty() {
+            if let Some(value) = default {
+                return Ok(value.to_string());
+            }
+            eprintln!("A value is required.");
+            continue;
+        }
+
+        return Ok(trimmed.to_string());
+    }
+}
+
+fn prompt_u16(prompt: &str, default: Option<u16>) -> io::Result<u16> {
+    loop {
+        let value = prompt_string(prompt, default.map(|v| v.to_string()).as_deref())?;
+        match value.parse::<u16>() {
+            Ok(parsed) => return Ok(parsed),
+            Err(_) => eprintln!("Please enter a valid number in range 0-65535."),
+        }
+    }
+}
+
+fn prompt_u64(prompt: &str, default: Option<u64>) -> io::Result<u64> {
+    loop {
+        let value = prompt_string(prompt, default.map(|v| v.to_string()).as_deref())?;
+        match value.parse::<u64>() {
+            Ok(parsed) => return Ok(parsed),
+            Err(_) => eprintln!("Please enter a valid positive integer."),
+        }
+    }
+}
+
+fn prompt_u8(prompt: &str, default: Option<u8>) -> io::Result<u8> {
+    loop {
+        let value = prompt_string(prompt, default.map(|v| v.to_string()).as_deref())?;
+        match value.parse::<u8>() {
+            Ok(parsed) => return Ok(parsed),
+            Err(_) => eprintln!("Please enter a valid choice."),
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    let escaped = value.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 async fn reserve_and_bind_public_listener(state: &RelayState) -> io::Result<(u16, TcpListener)> {
