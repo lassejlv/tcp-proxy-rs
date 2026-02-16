@@ -6,7 +6,11 @@ services:
     command:
       - relay
       - --public-bind
-      - 0.0.0.0:2222
+      - 0.0.0.0
+      - --public-port-start
+      - "2222"
+      - --public-port-end
+      - "2300"
       - --control-bind
       - 0.0.0.0:7000
       - --data-bind
@@ -14,7 +18,7 @@ services:
       - --token
       - ${PROXY_TOKEN}
     ports:
-      - "2222:2222"
+      - "2222-2300:2222-2300"
       - "7000:7000"
       - "7001:7001"
     environment:

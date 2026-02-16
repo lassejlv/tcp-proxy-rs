@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::time::{Duration, sleep};
 
 const MAX_LINE_LEN: usize = 1024;
@@ -23,9 +23,15 @@ struct Cli {
 enum Command {
     /// Runs on the public server and accepts public clients + agent connections.
     Relay {
-        /// Public TCP bind address where external clients connect (e.g. 0.0.0.0:2222).
-        #[arg(long, env = "PROXY_PUBLIC_BIND", default_value = "0.0.0.0:2222")]
+        /// Public bind host/IP where assigned ports are opened (e.g. 0.0.0.0).
+        #[arg(long, env = "PROXY_PUBLIC_BIND", default_value = "0.0.0.0")]
         public_bind: String,
+        /// Start of public port range assigned to agents.
+        #[arg(long, env = "PROXY_PUBLIC_PORT_START", default_value_t = 2222)]
+        public_port_start: u16,
+        /// End of public port range assigned to agents.
+        #[arg(long, env = "PROXY_PUBLIC_PORT_END", default_value_t = 2300)]
+        public_port_end: u16,
         /// Control plane bind address for the home agent.
         #[arg(long, env = "PROXY_CONTROL_BIND", default_value = "0.0.0.0:7000")]
         control_bind: String,
@@ -65,10 +71,73 @@ enum Command {
 #[derive(Clone)]
 struct RelayState {
     token: Arc<String>,
-    pending: Arc<Mutex<HashMap<u64, TcpStream>>>,
-    control_writer: Arc<Mutex<Option<Arc<Mutex<OwnedWriteHalf>>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingSession>>>,
+    agents: Arc<Mutex<HashMap<u64, AgentHandle>>>,
     next_session_id: Arc<AtomicU64>,
+    next_agent_id: Arc<AtomicU64>,
+    port_pool: Arc<Mutex<PortPool>>,
+    public_bind_host: Arc<String>,
     open_timeout: Duration,
+}
+
+struct PendingSession {
+    agent_id: u64,
+    stream: TcpStream,
+}
+
+#[derive(Clone)]
+struct AgentHandle {
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    assigned_port: u16,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+struct PortPool {
+    start: u16,
+    end: u16,
+    next: u16,
+    in_use: HashSet<u16>,
+}
+
+impl PortPool {
+    fn new(start: u16, end: u16) -> io::Result<Self> {
+        if start > end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid port range: start {start} is greater than end {end}"),
+            ));
+        }
+        Ok(Self {
+            start,
+            end,
+            next: start,
+            in_use: HashSet::new(),
+        })
+    }
+
+    fn reserve_next(&mut self) -> io::Result<u16> {
+        let total_ports = usize::from(self.end - self.start) + 1;
+        for _ in 0..total_ports {
+            let candidate = self.next;
+            self.next = if self.next == self.end {
+                self.start
+            } else {
+                self.next + 1
+            };
+            if self.in_use.insert(candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("no free public ports in range {}-{}", self.start, self.end),
+        ))
+    }
+
+    fn release(&mut self, port: u16) {
+        self.in_use.remove(&port);
+    }
 }
 
 #[derive(Clone)]
@@ -87,22 +156,31 @@ enum RelayControlMsg {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
-    let result = match cli.command {
+    match cli.command {
         Command::Relay {
             public_bind,
+            public_port_start,
+            public_port_end,
             control_bind,
             data_bind,
             token,
             open_timeout_secs,
         } => {
+            let port_pool = match PortPool::new(public_port_start, public_port_end) {
+                Ok(pool) => pool,
+                Err(err) => return Err(err),
+            };
             let state = RelayState {
                 token: Arc::new(token),
                 pending: Arc::new(Mutex::new(HashMap::new())),
-                control_writer: Arc::new(Mutex::new(None)),
+                agents: Arc::new(Mutex::new(HashMap::new())),
                 next_session_id: Arc::new(AtomicU64::new(1)),
+                next_agent_id: Arc::new(AtomicU64::new(1)),
+                port_pool: Arc::new(Mutex::new(port_pool)),
+                public_bind_host: Arc::new(public_bind.clone()),
                 open_timeout: Duration::from_secs(open_timeout_secs),
             };
             run_relay(public_bind, control_bind, data_bind, state).await
@@ -125,11 +203,6 @@ async fn main() {
             };
             run_agent(config).await
         }
-    };
-
-    if let Err(err) = result {
-        eprintln!("fatal error: {err}");
-        std::process::exit(1);
     }
 }
 
@@ -139,11 +212,12 @@ async fn run_relay(
     data_bind: String,
     state: RelayState,
 ) -> io::Result<()> {
-    let public_listener = TcpListener::bind(&public_bind).await?;
     let control_listener = TcpListener::bind(&control_bind).await?;
     let data_listener = TcpListener::bind(&data_bind).await?;
 
-    println!("relay listening: public={public_bind}, control={control_bind}, data={data_bind}");
+    println!(
+        "relay listening: public-host={public_bind}, control={control_bind}, data={data_bind}"
+    );
 
     {
         let state = state.clone();
@@ -163,15 +237,8 @@ async fn run_relay(
         });
     }
 
-    loop {
-        let (client_stream, client_addr) = public_listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_public_client(state, client_stream, client_addr).await {
-                eprintln!("public client handling error ({client_addr}): {err}");
-            }
-        });
-    }
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 async fn run_control_listener(listener: TcpListener, state: RelayState) -> io::Result<()> {
@@ -215,14 +282,40 @@ async fn handle_control_connection(
     }
 
     let writer_arc = Arc::new(Mutex::new(writer));
+    let agent_id = state.next_agent_id.fetch_add(1, Ordering::Relaxed);
+    let (assigned_port, public_listener) = reserve_and_bind_public_listener(&state).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     {
-        let mut guard = state.control_writer.lock().await;
-        *guard = Some(writer_arc.clone());
+        let mut agents = state.agents.lock().await;
+        agents.insert(
+            agent_id,
+            AgentHandle {
+                writer: writer_arc.clone(),
+                assigned_port,
+                shutdown_tx: shutdown_tx.clone(),
+            },
+        );
     }
 
-    println!("agent connected on control plane from {addr}");
+    let assigned_msg = format!("ASSIGNED {assigned_port}\n");
+    {
+        let mut guard = writer_arc.lock().await;
+        guard.write_all(assigned_msg.as_bytes()).await?;
+    }
 
-    let mut clear_slot_on_exit = true;
+    println!("agent {agent_id} connected from {addr}; assigned public port {assigned_port}");
+
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) =
+                run_agent_public_listener(public_listener, state, agent_id, shutdown_rx).await
+            {
+                eprintln!("agent {agent_id} public listener stopped: {err}");
+            }
+        });
+    }
 
     loop {
         let line = match read_line(&mut reader, MAX_LINE_LEN).await {
@@ -236,9 +329,9 @@ async fn handle_control_connection(
 
         match parse_relay_control_msg(&line) {
             Ok(RelayControlMsg::Fail(id)) => {
-                let removed = state.pending.lock().await.remove(&id);
+                let removed = remove_pending_session_for_agent(&state, id, agent_id).await;
                 if removed.is_some() {
-                    println!("session {id} failed by agent signal");
+                    println!("session {id} failed by agent {agent_id} signal");
                 }
             }
             Err(err) => {
@@ -247,19 +340,19 @@ async fn handle_control_connection(
         }
     }
 
-    if clear_slot_on_exit {
-        let mut guard = state.control_writer.lock().await;
-        if let Some(current_writer) = guard.as_ref() {
-            if Arc::ptr_eq(current_writer, &writer_arc) {
-                *guard = None;
-            } else {
-                clear_slot_on_exit = false;
-            }
-        }
-    }
+    let removed_agent = {
+        let mut agents = state.agents.lock().await;
+        agents.remove(&agent_id)
+    };
 
-    if clear_slot_on_exit {
-        println!("agent disconnected from control plane: {addr}");
+    if let Some(agent) = removed_agent {
+        let _ = agent.shutdown_tx.send(true);
+        state.port_pool.lock().await.release(agent.assigned_port);
+        drop_pending_for_agent(&state, agent_id).await;
+        println!(
+            "agent {agent_id} disconnected from control plane: {addr} (released public port {})",
+            agent.assigned_port
+        );
     }
 
     Ok(())
@@ -269,14 +362,21 @@ async fn handle_public_client(
     state: RelayState,
     client_stream: TcpStream,
     client_addr: SocketAddr,
+    agent_id: u64,
 ) -> io::Result<()> {
     let session_id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
 
-    state.pending.lock().await.insert(session_id, client_stream);
+    state.pending.lock().await.insert(
+        session_id,
+        PendingSession {
+            agent_id,
+            stream: client_stream,
+        },
+    );
 
     let writer = {
-        let guard = state.control_writer.lock().await;
-        guard.clone()
+        let guard = state.agents.lock().await;
+        guard.get(&agent_id).map(|agent| agent.writer.clone())
     };
 
     let Some(writer) = writer else {
@@ -299,7 +399,7 @@ async fn handle_public_client(
         }
     }
 
-    println!("opened session {session_id} for public client {client_addr}");
+    println!("opened session {session_id} for public client {client_addr} via agent {agent_id}");
 
     let pending = state.pending.clone();
     let timeout = state.open_timeout;
@@ -335,7 +435,7 @@ async fn handle_data_connection(
         ));
     };
 
-    let _ = tokio::io::copy_bidirectional(&mut public_stream, &mut stream).await;
+    let _ = tokio::io::copy_bidirectional(&mut public_stream.stream, &mut stream).await;
     println!("session {session_id} closed (data peer: {addr})");
 
     Ok(())
@@ -374,6 +474,9 @@ async fn handle_agent_control_session(
     writer.write_all(auth_msg.as_bytes()).await?;
 
     let writer = Arc::new(Mutex::new(writer));
+    let assigned_line = read_line(&mut reader, MAX_LINE_LEN).await?;
+    let assigned_port = parse_assigned_line(&assigned_line)?;
+    println!("assigned public relay port {assigned_port}");
 
     loop {
         let line = read_line(&mut reader, MAX_LINE_LEN).await?;
@@ -519,6 +622,17 @@ fn parse_open_line(line: &str) -> io::Result<u64> {
     parse_u64(rest.trim(), "session id")
 }
 
+fn parse_assigned_line(line: &str) -> io::Result<u16> {
+    let (cmd, rest) = split_two(line)?;
+    if cmd != "ASSIGNED" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid ASSIGNED line: {line}"),
+        ));
+    }
+    parse_u16(rest.trim(), "assigned port")
+}
+
 fn split_two(line: &str) -> io::Result<(&str, &str)> {
     let mut parts = line.splitn(2, ' ');
     let first = parts.next().unwrap_or_default();
@@ -541,4 +655,80 @@ fn parse_u64(value: &str, label: &str) -> io::Result<u64> {
             format!("failed to parse {label} as u64 ('{value}'): {err}"),
         )
     })
+}
+
+fn parse_u16(value: &str, label: &str) -> io::Result<u16> {
+    value.parse::<u16>().map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to parse {label} as u16 ('{value}'): {err}"),
+        )
+    })
+}
+
+async fn reserve_and_bind_public_listener(state: &RelayState) -> io::Result<(u16, TcpListener)> {
+    loop {
+        let candidate_port = {
+            let mut pool = state.port_pool.lock().await;
+            pool.reserve_next()?
+        };
+
+        let bind_addr = format!("{}:{}", state.public_bind_host, candidate_port);
+        match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => return Ok((candidate_port, listener)),
+            Err(err) => {
+                state.port_pool.lock().await.release(candidate_port);
+                eprintln!("failed to bind assigned public port {candidate_port}: {err}");
+            }
+        }
+    }
+}
+
+async fn run_agent_public_listener(
+    listener: TcpListener,
+    state: RelayState,
+    agent_id: u64,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> io::Result<()> {
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_ok() && *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                let (client_stream, client_addr) = accepted?;
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_public_client(state, client_stream, client_addr, agent_id).await {
+                        eprintln!("public client handling error ({client_addr}): {err}");
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn remove_pending_session_for_agent(
+    state: &RelayState,
+    session_id: u64,
+    agent_id: u64,
+) -> Option<PendingSession> {
+    let mut pending = state.pending.lock().await;
+    if pending
+        .get(&session_id)
+        .map(|session| session.agent_id == agent_id)
+        .unwrap_or(false)
+    {
+        return pending.remove(&session_id);
+    }
+    None
+}
+
+async fn drop_pending_for_agent(state: &RelayState, agent_id: u64) {
+    let mut pending = state.pending.lock().await;
+    pending.retain(|_, session| session.agent_id != agent_id);
 }
