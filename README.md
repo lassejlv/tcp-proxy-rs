@@ -58,14 +58,6 @@ ssh -p <assigned-port-printed-by-agent> root@<public-ip>
 
 ## Binary usage
 
-Interactive setup wizard:
-
-```bash
-cargo run -- setup
-```
-
-This opens a terminal UI flow where the user selects `agent` or `client` and gets ready-to-run commands.
-
 Relay:
 
 ```bash
